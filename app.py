@@ -25,33 +25,40 @@ def index():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json or {}
+    # amoCRM отправляет данные как form-data, не JSON
+    form = request.form
 
-    # Обработка сделок
-    leads = data.get("leads", {})
+    # Ищем данные о новых сделках в form-data
+    # amoCRM шлёт ключи вида: leads[add][0][name], leads[add][0][price]
+    i = 0
+    while True:
+        name_key = f"leads[add][{i}][name]"
+        if name_key not in form:
+            break
 
-    # Новая сделка или смена статуса
-    for action in ["add", "status", "update"]:
-        for lead in leads.get(action, []):
+        name = form.get(f"leads[add][{i}][name]", "Без названия")
+        price = form.get(f"leads[add][{i}][price]", "0")
+
+        text = (
+            f"<b>Новая сделка!</b>\n\n"
+            f"<b>Название:</b> {name}\n"
+            f"<b>Сумма:</b> {price} руб."
+        )
+
+        send_telegram(text)
+        i += 1
+
+    # Если ничего не нашли в form-data, пробуем JSON (на всякий случай)
+    if i == 0:
+        data = request.json or {}
+        leads = data.get("leads", {})
+        for lead in leads.get("add", []):
             name = lead.get("name", "Без названия")
-            price = lead.get("price", 0)
-            status_id = lead.get("status_id", "")
-            pipeline_id = lead.get("pipeline_id", "")
-            responsible = lead.get("responsible_user_id", "")
-
-            if action == "add":
-                emoji = "NEW"
-                action_text = "Новая сделка"
-            elif action == "status":
-                emoji = "UPD"
-                action_text = "Смена статуса"
-            else:
-                emoji = "EDIT"
-                action_text = "Изменение"
+            price = lead.get("price", "0")
 
             text = (
-                f"<b>[{emoji}] {action_text}</b>\n\n"
-                f"<b>Сделка:</b> {name}\n"
+                f"<b>Новая сделка!</b>\n\n"
+                f"<b>Название:</b> {name}\n"
                 f"<b>Сумма:</b> {price} руб."
             )
 
