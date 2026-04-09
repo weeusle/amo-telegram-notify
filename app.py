@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 from flask import Flask, request
 
@@ -9,7 +10,6 @@ CHAT_ID = os.environ.get("CHAT_ID")
 
 
 def send_telegram(text):
-    """Отправляет сообщение в Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, json={
         "chat_id": CHAT_ID,
@@ -25,44 +25,55 @@ def index():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # amoCRM отправляет данные как form-data, не JSON
-    form = request.form
+    # Логируем всё что пришло для отладки
+    raw_data = request.get_data(as_text=True)
+    print(f"=== WEBHOOK RECEIVED ===")
+    print(f"Content-Type: {request.content_type}")
+    print(f"Raw data: {raw_data[:2000]}")
+    print(f"========================")
 
-    # Ищем данные о новых сделках в form-data
-    # amoCRM шлёт ключи вида: leads[add][0][name], leads[add][0][price]
-    i = 0
-    while True:
-        name_key = f"leads[add][{i}][name]"
-        if name_key not in form:
-            break
+    found = False
 
-        name = form.get(f"leads[add][{i}][name]", "Без названия")
-        price = form.get(f"leads[add][{i}][price]", "0")
+    # Способ 1: form-data (основной формат amoCRM)
+    if request.form:
+        form = request.form
+        print(f"Form keys: {list(form.keys())[:20]}")
 
-        text = (
-            f"<b>Новая сделка!</b>\n\n"
-            f"<b>Название:</b> {name}\n"
-            f"<b>Сумма:</b> {price} руб."
-        )
-
-        send_telegram(text)
-        i += 1
-
-    # Если ничего не нашли в form-data, пробуем JSON (на всякий случай)
-    if i == 0:
-        data = request.json or {}
-        leads = data.get("leads", {})
-        for lead in leads.get("add", []):
-            name = lead.get("name", "Без названия")
-            price = lead.get("price", "0")
-
-            text = (
+        i = 0
+        while True:
+            name_key = f"leads[add][{i}][name]"
+            if name_key not in form:
+                break
+            name = form.get(f"leads[add][{i}][name]", "Без названия")
+            price = form.get(f"leads[add][{i}][price]", "0")
+            send_telegram(
                 f"<b>Новая сделка!</b>\n\n"
                 f"<b>Название:</b> {name}\n"
                 f"<b>Сумма:</b> {price} руб."
             )
+            found = True
+            i += 1
 
-            send_telegram(text)
+    # Способ 2: JSON
+    if not found:
+        try:
+            data = request.json or {}
+            leads = data.get("leads", {})
+            for lead in leads.get("add", []):
+                name = lead.get("name", "Без названия")
+                price = lead.get("price", "0")
+                send_telegram(
+                    f"<b>Новая сделка!</b>\n\n"
+                    f"<b>Название:</b> {name}\n"
+                    f"<b>Сумма:</b> {price} руб."
+                )
+                found = True
+        except Exception:
+            pass
+
+    # Если ничего не распознали — отправляем сырые данные для отладки
+    if not found:
+        send_telegram(f"<b>Webhook получен, но формат не распознан.</b>\n\n{raw_data[:500]}")
 
     return "ok", 200
 
