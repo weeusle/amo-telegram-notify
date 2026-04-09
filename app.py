@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote
 import requests
@@ -12,6 +13,10 @@ AMO_TOKEN = os.environ.get("AMO_TOKEN")
 AMO_DOMAIN = os.environ.get("AMO_DOMAIN")
 
 MSK = timezone(timedelta(hours=3))
+
+# Защита от дублей: храним ID обработанных сделок
+processed_leads = set()
+processed_lock = threading.Lock()
 
 
 def send_telegram(text):
@@ -29,17 +34,15 @@ def get_contact_telegram(lead_id):
         headers = {"Authorization": f"Bearer {AMO_TOKEN}"}
         base = f"https://{AMO_DOMAIN}.amocrm.ru/api/v4"
 
-        # Получаем контакты сделки
         resp = requests.get(
             f"{base}/leads/{lead_id}",
             headers=headers,
             params={"with": "contacts"},
+            timeout=5,
         )
         data = resp.json()
 
-        contacts = (
-            data.get("_embedded", {}).get("contacts", [])
-        )
+        contacts = data.get("_embedded", {}).get("contacts", [])
         if not contacts:
             return None
 
@@ -47,14 +50,13 @@ def get_contact_telegram(lead_id):
         if not contact_id:
             return None
 
-        # Получаем данные контакта
         resp2 = requests.get(
             f"{base}/contacts/{contact_id}",
             headers=headers,
+            timeout=5,
         )
         contact = resp2.json()
 
-        # Ищем поле Telegram среди кастомных полей
         for field in contact.get("custom_fields_values", []):
             name = field.get("field_name", "").lower()
             if "telegram" in name:
@@ -69,13 +71,48 @@ def get_contact_telegram(lead_id):
 
 
 def parse_amo_form(raw_data):
-    """Парсит URL-encoded данные от amoCRM."""
     params = {}
     for pair in raw_data.split("&"):
         if "=" in pair:
             key, value = pair.split("=", 1)
             params[unquote(key)] = unquote(value).replace("+", " ")
     return params
+
+
+def process_lead(lead_id, name, price, date_create, custom_fields):
+    """Обрабатывает сделку в фоне, чтобы не задерживать ответ amoCRM."""
+    # Форматируем дату
+    date_str = "—"
+    if date_create:
+        try:
+            dt = datetime.fromtimestamp(int(date_create), tz=MSK)
+            date_str = dt.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            date_str = date_create
+
+    # Получаем Telegram контакта через API
+    tg_contact = get_contact_telegram(lead_id) if lead_id else None
+
+    # Формируем сообщение
+    lines = [
+        "<b>Новая заявка!</b>",
+        "",
+        f"<b>Дата:</b> {date_str}",
+        f"<b>Название:</b> {name}",
+    ]
+
+    if price and price != "0":
+        lines.append(f"<b>Бюджет:</b> {price} руб.")
+
+    skip_fields = {"_ym_uid", "_ym_counter"}
+    for cf_name, cf_value in custom_fields.items():
+        if cf_name not in skip_fields and cf_value:
+            lines.append(f"<b>{cf_name}:</b> {cf_value}")
+
+    if tg_contact:
+        lines.append(f"\n<b>Telegram:</b> {tg_contact}")
+
+    send_telegram("\n".join(lines))
 
 
 @app.route("/", methods=["GET"])
@@ -95,18 +132,21 @@ def webhook():
             break
 
         lead_id = params.get(f"leads[add][{i}][id]", "")
+
+        # Защита от дублей
+        with processed_lock:
+            if lead_id in processed_leads:
+                i += 1
+                continue
+            processed_leads.add(lead_id)
+            # Чистим старые записи, чтобы не копилась память
+            if len(processed_leads) > 1000:
+                processed_leads.clear()
+                processed_leads.add(lead_id)
+
         name = params.get(f"leads[add][{i}][name]", "—")
         price = params.get(f"leads[add][{i}][price]", "0")
         date_create = params.get(f"leads[add][{i}][date_create]", "")
-
-        # Форматируем дату
-        date_str = "—"
-        if date_create:
-            try:
-                dt = datetime.fromtimestamp(int(date_create), tz=MSK)
-                date_str = dt.strftime("%d.%m.%Y %H:%M")
-            except Exception:
-                date_str = date_create
 
         # Собираем кастомные поля
         custom_fields = {}
@@ -122,33 +162,16 @@ def webhook():
             custom_fields[cf_name] = cf_value
             j += 1
 
-        # Получаем Telegram контакта через API
-        tg_contact = get_contact_telegram(lead_id) if lead_id else None
+        # Обрабатываем в фоне, чтобы мгновенно ответить amoCRM
+        thread = threading.Thread(
+            target=process_lead,
+            args=(lead_id, name, price, date_create, custom_fields),
+        )
+        thread.start()
 
-        # Формируем сообщение
-        lines = [
-            "<b>Новая заявка!</b>",
-            "",
-            f"<b>Дата:</b> {date_str}",
-            f"<b>Название:</b> {name}",
-        ]
-
-        if price and price != "0":
-            lines.append(f"<b>Бюджет:</b> {price} руб.")
-
-        # Кастомные поля (кроме служебных)
-        skip_fields = {"_ym_uid", "_ym_counter"}
-        for cf_name, cf_value in custom_fields.items():
-            if cf_name not in skip_fields and cf_value:
-                lines.append(f"<b>{cf_name}:</b> {cf_value}")
-
-        # Telegram контакта
-        if tg_contact:
-            lines.append(f"\n<b>Telegram:</b> {tg_contact}")
-
-        send_telegram("\n".join(lines))
         i += 1
 
+    # Мгновенный ответ — amoCRM не будет слать повторы
     return "ok", 200
 
 
